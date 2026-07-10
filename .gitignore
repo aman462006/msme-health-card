@@ -1,8 +1,41 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+.kaggle/
+*.pem
+*.key
+
+# Python artefacts
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
-.env
+*.pyd
+.venv/
+venv/
+
+# Data & model binaries — too large / contain PII
+data/raw/
+data/processed/
+models/
+*.csv
+*.parquet
+*.zip
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.onnx
+
+# Logs
+*.log
+
+# PDFs / screenshots — not source code
 *.pdf
-screenshots/
-screenshot.py
-.streamlit/secrets.toml
+
+# Node
+node_modules/
+frontend/build/
+frontend/.env
+frontend/.env.local
