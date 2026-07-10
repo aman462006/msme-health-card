@@ -24,6 +24,7 @@ from src.config import (
 # ---------------------------------------------------------------------------
 _ML_READY = False
 _DICE_READY = False
+_ML_ERR = None
 try:
     from src.models.main_model import load_pillar_weights
     from src.models.thin_file import predict_thin_file
@@ -36,6 +37,7 @@ try:
     from src.consistency.engine import run_consistency_engine
     _ML_READY = True
 except Exception as _ml_err:
+    _ML_ERR = str(_ml_err)
     print(f"ML packages not available ({_ml_err}). /assess will return 503.")
 
 try:
@@ -114,6 +116,7 @@ def health():
     return {
         "status": "ok",
         "ml_packages_installed": _ML_READY,
+        "ml_import_error":       _ML_ERR,
         "dice_ready":            _DICE_READY,
         "main_model_loaded":     _main_model is not None,
         "thin_model_loaded":     _thin_model is not None,
