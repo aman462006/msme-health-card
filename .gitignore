@@ -15,15 +15,14 @@ __pycache__/
 .venv/
 venv/
 
-# Data & model binaries — too large / contain PII
+# Data — contains PII / too large
 data/raw/
 data/processed/
-models/
 *.csv
 *.parquet
 *.zip
-*.pkl
-*.joblib
+
+# Model binaries — committed via models/ directory
 *.h5
 *.pt
 *.onnx
