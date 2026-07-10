@@ -1,0 +1,15 @@
+{
+  "files": {
+    "main.css": "/msme-health-card/static/css/main.2d8be757.css",
+    "main.js": "/msme-health-card/static/js/main.b19281e3.js",
+    "static/js/453.6c4fbaa7.chunk.js": "/msme-health-card/static/js/453.6c4fbaa7.chunk.js",
+    "index.html": "/msme-health-card/index.html",
+    "main.2d8be757.css.map": "/msme-health-card/static/css/main.2d8be757.css.map",
+    "main.b19281e3.js.map": "/msme-health-card/static/js/main.b19281e3.js.map",
+    "453.6c4fbaa7.chunk.js.map": "/msme-health-card/static/js/453.6c4fbaa7.chunk.js.map"
+  },
+  "entrypoints": [
+    "static/css/main.2d8be757.css",
+    "static/js/main.b19281e3.js"
+  ]
+}
