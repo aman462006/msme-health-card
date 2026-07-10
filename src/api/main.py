@@ -1,6 +1,8 @@
 """
 FastAPI backend — /assess endpoint.
-Returns the complete Financial Health Card as a single JSON response.
+Heavy ML packages (shap, lightgbm, mapie, dice-ml) are imported lazily so the
+server starts even when only the slim deployment requirements are installed.
+/assess returns 503 until trained model files are present.
 """
 import numpy as np
 import pandas as pd
@@ -16,20 +18,29 @@ from src.config import (
     ALL_FEATURES, PILLARS, THIN_FILE_FEATURES,
     MODELS_DIR, COVERAGE_THRESHOLD, SCORE_MIN, SCORE_MAX,
 )
-from src.models.main_model import pd_to_score, load_pillar_weights
-from src.models.thin_file import compute_coverage_index, predict_thin_file
-from src.models.cohort_weights import get_pillar_weights_for_cohort
-from src.data.cohort_builder import (
-    assign_cohort_from_training, get_peer_percentile, load_cohort_data,
-)
-from src.models.eligibility import decide_eligibility
-from src.explainability.shap_engine import compute_shap, get_strengths_and_risks, compute_pillar_scores
-from src.explainability.dice_engine import get_counterfactuals
-from src.consistency.engine import run_consistency_engine
+
+# ---------------------------------------------------------------------------
+# Heavy ML imports — optional. Server starts even if these packages are absent.
+# ---------------------------------------------------------------------------
+_ML_READY = False
+try:
+    from src.models.main_model import load_pillar_weights
+    from src.models.thin_file import predict_thin_file
+    from src.models.cohort_weights import get_pillar_weights_for_cohort
+    from src.data.cohort_builder import get_peer_percentile, load_cohort_data
+    from src.models.eligibility import decide_eligibility
+    from src.explainability.shap_engine import (
+        compute_shap, get_strengths_and_risks, compute_pillar_scores,
+    )
+    from src.explainability.dice_engine import get_counterfactuals
+    from src.consistency.engine import run_consistency_engine
+    _ML_READY = True
+except Exception as _ml_err:
+    print(f"ML packages not available ({_ml_err}). /assess will return 503.")
 
 app = FastAPI(
     title="MSME Financial Health Card API",
-    description="AI-driven credit assessment for New-to-Credit MSMEs using alternate data",
+    description="AI-driven credit assessment for New-to-Credit MSMEs",
     version="2.0.0",
 )
 
@@ -40,31 +51,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Loaded at startup
-_main_model = None
-_thin_model = None
-_global_pillar_weights = None
-_cohort_weights = None        # per-cohort SHAP pillar weights
-_weight_ci = None             # bootstrap CIs on global weights
-_cohort_data = None           # PD distributions per cohort
-_training_df = None
+_main_model        = None
+_thin_model        = None
+_global_weights    = None
+_cohort_weights    = None
+_weight_ci         = None
+_cohort_data       = None
+_training_df       = None
 
 
 @app.on_event("startup")
 def load_models():
-    global _main_model, _thin_model, _global_pillar_weights
+    global _main_model, _thin_model, _global_weights
     global _cohort_weights, _weight_ci, _cohort_data, _training_df
 
-    for path, attr, label in [
-        (MODELS_DIR / "main_model_ri.pkl", "_main_model", "main model (RI)"),
-        (MODELS_DIR / "main_model.pkl", "_main_model", "main model"),
+    if not _ML_READY:
+        print("Skipping model load — ML packages not installed.")
+        return
+
+    for path, label in [
+        (MODELS_DIR / "main_model_ri.pkl", "main model (RI)"),
+        (MODELS_DIR / "main_model.pkl",    "main model"),
     ]:
-        if path.exists() and globals()[attr] is None:
-            globals()[attr] = joblib.load(path)
+        if path.exists() and _main_model is None:
+            _main_model = joblib.load(path)
             print(f"Loaded {label}")
             break
-    if _main_model is None:
-        print("WARNING: No trained model found. Run train.py first.")
 
     thin_path = MODELS_DIR / "thin_file_model.pkl"
     if thin_path.exists():
@@ -72,47 +84,50 @@ def load_models():
         print("Loaded thin-file model")
 
     try:
-        _global_pillar_weights = load_pillar_weights()
-    except FileNotFoundError:
-        _global_pillar_weights = {p: 1 / len(PILLARS) for p in PILLARS}
+        _global_weights = load_pillar_weights()
+    except Exception:
+        _global_weights = {p: 1 / len(PILLARS) for p in PILLARS}
 
-    cohort_w_path = MODELS_DIR / "cohort_pillar_weights.pkl"
-    if cohort_w_path.exists():
-        _cohort_weights = joblib.load(cohort_w_path)
-
-    weight_ci_path = MODELS_DIR / "pillar_weight_ci.pkl"
-    if weight_ci_path.exists():
-        _weight_ci = joblib.load(weight_ci_path)
-
-    cohort_path = MODELS_DIR / "cohort_data.pkl"
-    if cohort_path.exists():
-        _cohort_data = joblib.load(cohort_path)
-        print(f"Loaded cohort distributions ({len(_cohort_data)-1} cohorts)")
+    for path, var in [
+        (MODELS_DIR / "cohort_pillar_weights.pkl", "_cohort_weights"),
+        (MODELS_DIR / "pillar_weight_ci.pkl",      "_weight_ci"),
+        (MODELS_DIR / "cohort_data.pkl",           "_cohort_data"),
+    ]:
+        if path.exists():
+            globals()[var] = joblib.load(path)
 
     try:
         from src.config import DATA_PROCESSED
         _training_df = pd.read_parquet(DATA_PROCESSED / "msme_features.parquet")
     except Exception:
-        _training_df = None
+        pass
 
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "main_model_loaded": _main_model is not None,
-        "thin_model_loaded": _thin_model is not None,
-        "cohort_data_loaded": _cohort_data is not None,
-        "cohort_weights_loaded": _cohort_weights is not None,
+        "ml_packages_installed": _ML_READY,
+        "main_model_loaded":     _main_model is not None,
+        "thin_model_loaded":     _thin_model is not None,
+        "cohort_data_loaded":    _cohort_data is not None,
     }
 
 
 @app.post("/assess", response_model=HealthCardResponse)
 def assess(msme: MSMEInput):
-    if _main_model is None:
-        raise HTTPException(503, "Models not loaded. Run train.py first.")
+    if not _ML_READY:
+        raise HTTPException(
+            503,
+            "ML packages not installed on this deployment. "
+            "Run train.py locally and redeploy with full requirements-train.txt.",
+        )
+    if _main_model is None and _thin_model is None:
+        raise HTTPException(
+            503,
+            "No trained models found. Run train.py first, then redeploy.",
+        )
 
-    # Build feature row
     row_dict = {f: getattr(msme, f, None) for f in ALL_FEATURES}
     X_row = pd.DataFrame([row_dict])
 
@@ -121,127 +136,104 @@ def assess(msme: MSMEInput):
             if X_row[col].isna().all():
                 X_row[col] = _training_df[col].median()
 
-    provided = [f for f in ALL_FEATURES if getattr(msme, f, None) is not None]
-    coverage_index = compute_coverage_index(provided, _global_pillar_weights)
-
-    # Route to correct model
-    is_thin_file = coverage_index < COVERAGE_THRESHOLD or _main_model is None
-    pd_ci_width = 0.0
+    provided        = [f for f in ALL_FEATURES if getattr(msme, f, None) is not None]
+    coverage_index  = _coverage_index(provided)
+    is_thin_file    = coverage_index < COVERAGE_THRESHOLD or _main_model is None
+    pd_ci_width     = 0.0
 
     if not is_thin_file:
-        model_used = "main"
-        pd_val = float(_main_model.predict_proba(X_row[ALL_FEATURES])[:, 1][0])
+        model_used  = "main"
+        pd_val      = float(_main_model.predict_proba(X_row[ALL_FEATURES])[:, 1][0])
         pd_ci_width = 0.04
-        pd_lower = max(0.0, pd_val - pd_ci_width)
-        pd_upper = min(1.0, pd_val + pd_ci_width)
+        pd_lower    = max(0.0, pd_val - pd_ci_width)
+        pd_upper    = min(1.0, pd_val + pd_ci_width)
     else:
-        model_used = "thin_file"
         if _thin_model is None:
             raise HTTPException(503, "Thin-file model not loaded.")
+        model_used  = "thin_file"
         thin_result = predict_thin_file(_thin_model, X_row)
-        pd_val = thin_result["pd"]
-        pd_lower = thin_result["pd_lower"]
-        pd_upper = thin_result["pd_upper"]
+        pd_val      = thin_result["pd"]
+        pd_lower    = thin_result["pd_lower"]
+        pd_upper    = thin_result["pd_upper"]
         pd_ci_width = thin_result["interval_width"]
 
-    # Consistency engine
     consistency_input = {
-        "industry_type": msme.industry_type,
-        "gst_annual_turnover_lakhs": msme.gst_annual_turnover_lakhs,
-        "electricity_kwh_monthly": msme.electricity_kwh_monthly,
-        "epfo_headcount": msme.epfo_headcount,
+        "industry_type":                msme.industry_type,
+        "gst_annual_turnover_lakhs":    msme.gst_annual_turnover_lakhs,
+        "electricity_kwh_monthly":      msme.electricity_kwh_monthly,
+        "epfo_headcount":               msme.epfo_headcount,
         "salary_outflow_monthly_lakhs": msme.salary_outflow_monthly_lakhs,
-        "gstr1_sales_lakhs": msme.gstr1_sales_lakhs,
-        "upi_credit_inflow_lakhs": msme.upi_credit_inflow_lakhs,
-        "bank_credit_inflow_lakhs": msme.bank_credit_inflow_lakhs,
-        "ewaybill_value_lakhs": msme.ewaybill_value_lakhs,
+        "gstr1_sales_lakhs":            msme.gstr1_sales_lakhs,
+        "upi_credit_inflow_lakhs":      msme.upi_credit_inflow_lakhs,
+        "bank_credit_inflow_lakhs":     msme.bank_credit_inflow_lakhs,
+        "ewaybill_value_lakhs":         msme.ewaybill_value_lakhs,
     }
     consistency = run_consistency_engine(consistency_input)
-    pd_upper = min(1.0, pd_upper + consistency.interval_widening)
+    pd_upper    = min(1.0, pd_upper + consistency.interval_widening)
 
-    # Cohort assignment
-    cohort = _resolve_cohort(msme)
-
-    # Peer-relative percentile (100 = best/lowest PD in cohort)
-    peer_percentile = 50.0  # fallback
+    cohort         = _resolve_cohort(msme)
+    peer_percentile = 50.0
     if _cohort_data is not None:
         peer_percentile = get_peer_percentile(pd_val, cohort, _cohort_data)
 
-    # Per-cohort pillar weights (SHAP output, recomputed per cohort at retrain)
-    if _cohort_weights is not None:
-        active_weights = get_pillar_weights_for_cohort(cohort, _cohort_weights)
-    else:
-        active_weights = _global_pillar_weights
+    active_weights = (
+        get_pillar_weights_for_cohort(cohort, _cohort_weights)
+        if _cohort_weights is not None else _global_weights
+    )
 
-    # Score from cohort-relative percentile, not absolute PD
-    score = _percentile_to_score(peer_percentile)
-    score_lower = _percentile_to_score(max(0, peer_percentile - 10))
-    score_upper = _percentile_to_score(min(100, peer_percentile + 10))
-    grade = _score_to_grade(score)
+    score       = _pct_to_score(peer_percentile)
+    score_lower = _pct_to_score(max(0,   peer_percentile - 10))
+    score_upper = _pct_to_score(min(100, peer_percentile + 10))
+    grade       = _score_to_grade(score)
 
-    # Eligibility decision: Eligible / Review / Declined
     eligibility_result = decide_eligibility(
-        pd_value=pd_val,
-        cohort=cohort,
-        cohort_data=_cohort_data if _cohort_data else {"_global": {
+        pd_value=pd_val, cohort=cohort,
+        cohort_data=_cohort_data or {"_global": {
             "eligible_pd_threshold": 0.10,
-            "review_pd_threshold": 0.25,
+            "review_pd_threshold":   0.25,
         }},
         peer_percentile=peer_percentile,
         is_thin_file=is_thin_file,
         pd_interval_width=pd_ci_width,
     )
 
-    # SHAP explanations
     if model_used == "main":
         shap_vals = compute_shap(_main_model, X_row[ALL_FEATURES])
-        sr = get_strengths_and_risks(shap_vals, X_row)
+        sr        = get_strengths_and_risks(shap_vals, X_row)
         pillar_sc = compute_pillar_scores(shap_vals, active_weights, X_row)
     else:
         shap_vals = {f: 0.0 for f in ALL_FEATURES}
-        sr = {"strengths": [], "risks": []}
+        sr        = {"strengths": [], "risks": []}
         pillar_sc = {p: peer_percentile for p in PILLARS}
 
-    # DiCE counterfactuals
     actions = []
     if _training_df is not None and model_used == "main":
         try:
-            cf_raw = get_counterfactuals(_main_model, X_row, _training_df)
             from src.api.schemas import CounterfactualAction, CounterfactualChange
-            for cf in cf_raw:
+            for cf in get_counterfactuals(_main_model, X_row, _training_df):
                 changes = [CounterfactualChange(**c) for c in cf["changes"]]
                 if changes:
                     actions.append(CounterfactualAction(changes=changes))
         except Exception:
             pass
 
-    # Missing pillars
     missing_pillars = [
-        pillar for pillar, feats in PILLARS.items()
+        p for p, feats in PILLARS.items()
         if sum(1 for f in feats if getattr(msme, f, None) is not None) < len(feats) * 0.5
     ]
 
-    # Build pillar score list with per-cohort weight CIs
     pillar_score_list = []
     for p, s in pillar_sc.items():
-        wci = None
-        if _weight_ci and p in _weight_ci:
-            wci = WeightCI(**_weight_ci[p])
-        pillar_score_list.append(
-            PillarScore(
-                pillar=p,
-                score=round(s, 1),
-                weight=round(active_weights.get(p, 0), 3),
-                weight_ci=wci,
-            )
-        )
+        wci = WeightCI(**_weight_ci[p]) if _weight_ci and p in _weight_ci else None
+        pillar_score_list.append(PillarScore(
+            pillar=p, score=round(s, 1),
+            weight=round(active_weights.get(p, 0), 3),
+            weight_ci=wci,
+        ))
 
     return HealthCardResponse(
-        score=score,
-        score_ci_lower=score_lower,
-        score_ci_upper=score_upper,
-        grade=grade,
-        peer_percentile=round(peer_percentile, 1),
+        score=score, score_ci_lower=score_lower, score_ci_upper=score_upper,
+        grade=grade, peer_percentile=round(peer_percentile, 1),
         eligibility=EligibilityOut(
             decision=eligibility_result.decision,
             reason=eligibility_result.reason,
@@ -252,31 +244,24 @@ def assess(msme: MSMEInput):
         pd_12m=round(pd_val, 4),
         pd_lower_bound=round(pd_lower, 4),
         pd_upper_bound=round(pd_upper, 4),
-        model_used=model_used,
-        coverage_index=round(coverage_index, 3),
-        peer_cohort=cohort,
-        gstin=msme.gstin,
+        model_used=model_used, coverage_index=round(coverage_index, 3),
+        peer_cohort=cohort, gstin=msme.gstin,
         pillar_scores=pillar_score_list,
         pillar_weights={k: round(v, 3) for k, v in active_weights.items()},
-        strengths=[
-            {"feature": s["feature"], "label": s["label"],
-             "shap_value": round(s["shap_value"], 4), "feature_value": s["feature_value"]}
-            for s in sr["strengths"]
-        ],
-        risks=[
-            {"feature": r["feature"], "label": r["label"],
-             "shap_value": round(r["shap_value"], 4), "feature_value": r["feature_value"]}
-            for r in sr["risks"]
-        ],
+        strengths=[{
+            "feature": s["feature"], "label": s["label"],
+            "shap_value": round(s["shap_value"], 4), "feature_value": s["feature_value"],
+        } for s in sr["strengths"]],
+        risks=[{
+            "feature": r["feature"], "label": r["label"],
+            "shap_value": round(r["shap_value"], 4), "feature_value": r["feature_value"],
+        } for r in sr["risks"]],
         actions_to_improve=actions,
         consistency_flags=[
             ConsistencyFlagOut(
-                check_name=f.check_name,
-                severity=f.severity,
-                description=f.description,
-                recommendation=f.recommendation,
-            )
-            for f in consistency.flags
+                check_name=f.check_name, severity=f.severity,
+                description=f.description, recommendation=f.recommendation,
+            ) for f in consistency.flags
         ],
         consistency_summary=consistency.summary(),
         manual_review_recommended=consistency.manual_review,
@@ -284,29 +269,32 @@ def assess(msme: MSMEInput):
     )
 
 
-def _percentile_to_score(percentile: float) -> int:
-    """Maps peer percentile (0-100) linearly to score range 300-900."""
-    return int(SCORE_MIN + (percentile / 100.0) * (SCORE_MAX - SCORE_MIN))
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _coverage_index(provided: list) -> float:
+    """Fraction of pillars where ≥50% of features are provided."""
+    provided_set = set(provided)
+    scores = [
+        sum(1 for f in feats if f in provided_set) / len(feats) >= 0.5
+        for feats in PILLARS.values()
+    ]
+    return sum(scores) / len(scores)
+
+
+def _pct_to_score(pct: float) -> int:
+    return int(SCORE_MIN + (pct / 100.0) * (SCORE_MAX - SCORE_MIN))
 
 
 def _score_to_grade(score: int) -> str:
-    if score >= 800: return "A+"
-    if score >= 750: return "A"
-    if score >= 700: return "B+"
-    if score >= 650: return "B"
-    if score >= 600: return "C+"
-    if score >= 550: return "C"
-    if score >= 500: return "D"
+    for threshold, grade in [(800,"A+"),(750,"A"),(700,"B+"),(650,"B"),
+                              (600,"C+"),(550,"C"),(500,"D")]:
+        if score >= threshold:
+            return grade
     return "E"
 
 
 def _resolve_cohort(msme: MSMEInput) -> str:
-    """Maps MSMEInput fields to the cohort key used in cohort_data."""
-    industry_map = {
-        "manufacturing": "manufacturing",
-        "services": "services",
-        "trading": "trading",
-    }
-    industry = industry_map.get(msme.industry_type.lower(), "services")
-    band = (msme.turnover_band or "1Cr-5Cr").strip()
-    return f"{industry}_{band}"
+    industry = {"manufacturing": "manufacturing", "services": "services",
+                "trading": "trading"}.get(msme.industry_type.lower(), "services")
+    return f"{industry}_{(msme.turnover_band or '1Cr-5Cr').strip()}"
