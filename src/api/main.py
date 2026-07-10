@@ -23,6 +23,7 @@ from src.config import (
 # Heavy ML imports — optional. Server starts even if these packages are absent.
 # ---------------------------------------------------------------------------
 _ML_READY = False
+_DICE_READY = False
 try:
     from src.models.main_model import load_pillar_weights
     from src.models.thin_file import predict_thin_file
@@ -32,11 +33,16 @@ try:
     from src.explainability.shap_engine import (
         compute_shap, get_strengths_and_risks, compute_pillar_scores,
     )
-    from src.explainability.dice_engine import get_counterfactuals
     from src.consistency.engine import run_consistency_engine
     _ML_READY = True
 except Exception as _ml_err:
     print(f"ML packages not available ({_ml_err}). /assess will return 503.")
+
+try:
+    from src.explainability.dice_engine import get_counterfactuals
+    _DICE_READY = True
+except Exception:
+    _DICE_READY = False
 
 app = FastAPI(
     title="MSME Financial Health Card API",
@@ -108,6 +114,7 @@ def health():
     return {
         "status": "ok",
         "ml_packages_installed": _ML_READY,
+        "dice_ready":            _DICE_READY,
         "main_model_loaded":     _main_model is not None,
         "thin_model_loaded":     _thin_model is not None,
         "cohort_data_loaded":    _cohort_data is not None,
@@ -207,7 +214,7 @@ def assess(msme: MSMEInput):
         pillar_sc = {p: peer_percentile for p in PILLARS}
 
     actions = []
-    if _training_df is not None and model_used == "main":
+    if _DICE_READY and _training_df is not None and model_used == "main":
         try:
             from src.api.schemas import CounterfactualAction, CounterfactualChange
             for cf in get_counterfactuals(_main_model, X_row, _training_df):
