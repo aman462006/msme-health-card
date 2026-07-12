@@ -78,10 +78,12 @@ def build_lgbm() -> lgb.LGBMClassifier:
         objective="binary",
         monotone_constraints=MONOTONE_LIST,
         monotone_constraints_method="advanced",
-        num_leaves=31,
-        min_child_samples=100,
-        n_estimators=500,
-        learning_rate=0.03,
+        num_leaves=8,
+        max_depth=4,
+        min_child_samples=1000,
+        n_estimators=200,
+        learning_rate=0.05,
+        reg_lambda=10.0,
         subsample=0.8,
         colsample_bytree=0.8,
         random_state=RANDOM_STATE,
@@ -116,7 +118,7 @@ def train(df: pd.DataFrame) -> dict:
     # cv=3: uses 3-fold cross-validation to fit the isotonic calibration.
     # Each fold's calibration is averaged. More folds = more stable calibration
     # but 3x slower. 3 is the minimum for reliable isotonic fitting on skewed data.
-    model = CalibratedClassifierCV(base, method="isotonic", cv=3)
+    model = CalibratedClassifierCV(base, method="sigmoid", cv=3)
     print("Training calibrated monotonic LightGBM...")
     model.fit(X_train, y_train)
 

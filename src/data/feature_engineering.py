@@ -241,12 +241,14 @@ def _add_synthetic_msme_overlay(df: pd.DataFrame) -> pd.DataFrame:
     n = len(df)
     target = df["TARGET"].values  # 1 = default
 
-    def _signal(base_mean, base_std, target_shift, target_noise_scale=0.5):
+    def _signal(base_mean, base_std, target_shift, target_noise_scale=1.5):
         """
         Generates a feature value correlated with default probability.
         base_mean / base_std: realistic population distribution
         target_shift: how much the mean shifts for defaulters (sign matches monotone constraint)
-        target_noise_scale: noise on the shift so defaulters are not perfectly separated
+        target_noise_scale: noise on the shift — kept large (1.5x shift) so defaulters and
+          non-defaulters overlap substantially, forcing the model to produce calibrated
+          intermediate probabilities rather than collapsing to 0/1.
         """
         base = RNG.normal(base_mean, base_std, n)
         shift = target * RNG.normal(target_shift, target_noise_scale, n)
@@ -293,10 +295,10 @@ def _add_synthetic_msme_overlay(df: pd.DataFrame) -> pd.DataFrame:
     #   Risk direction: fewer buffer days = higher risk (monotone -1, inverted)
     # -----------------------------------------------------------------------
     df["inflow_cv"] = np.clip(_signal(0.25, 0.12, 0.20), 0.01, 1.5)
-    df["min_balance_days"] = np.clip(_signal(5, 4, 8, 3), 0, 30)
-    df["inflow_outflow_lag"] = np.clip(_signal(3, 2, 5, 2), 0, 30)
-    df["drawdown_recovery_days"] = np.clip(_signal(15, 8, 20, 8), 1, 90)
-    df["loss_absorption_buffer"] = np.clip(_signal(20, 8, -12, 5), 1, 60)
+    df["min_balance_days"] = np.clip(_signal(5, 4, 8, 8), 0, 30)
+    df["inflow_outflow_lag"] = np.clip(_signal(3, 2, 5, 5), 0, 30)
+    df["drawdown_recovery_days"] = np.clip(_signal(15, 8, 20, 20), 1, 90)
+    df["loss_absorption_buffer"] = np.clip(_signal(20, 8, -12, 12), 1, 60)
 
     # -----------------------------------------------------------------------
     # P2: Revenue Quality (partial -- ext_source_1/2/3 are real Home Credit values)
@@ -328,10 +330,10 @@ def _add_synthetic_msme_overlay(df: pd.DataFrame) -> pd.DataFrame:
     #   Why HHI over count of buyers: 2 buyers at 99%/1% is as risky as 1 buyer.
     #   Risk direction: higher HHI = higher risk (monotone +1)
     # -----------------------------------------------------------------------
-    df["gst_mismatch_pct"] = np.clip(_signal(0.05, 0.04, 0.12, 0.05), 0, 0.5)
-    df["gst_filing_punctuality"] = np.clip(_signal(0.88, 0.10, -0.18, 0.08), 0, 1)
-    df["itc_reversal_freq"] = np.clip(_signal(0.04, 0.03, 0.10, 0.04), 0, 0.5)
-    df["buyer_concentration_hhi"] = np.clip(_signal(0.25, 0.15, 0.20, 0.10), 0, 1)
+    df["gst_mismatch_pct"] = np.clip(_signal(0.05, 0.04, 0.12, 0.12), 0, 0.5)
+    df["gst_filing_punctuality"] = np.clip(_signal(0.88, 0.10, -0.18, 0.18), 0, 1)
+    df["itc_reversal_freq"] = np.clip(_signal(0.04, 0.03, 0.10, 0.10), 0, 0.5)
+    df["buyer_concentration_hhi"] = np.clip(_signal(0.25, 0.15, 0.20, 0.20), 0, 1)
 
     # -----------------------------------------------------------------------
     # P3: Obligation Discipline (partial -- avg_days_past_due and emi_bounce_rate
@@ -357,11 +359,11 @@ def _add_synthetic_msme_overlay(df: pd.DataFrame) -> pd.DataFrame:
     #   Even one late month in 24 is a compliance signal; chronic lateness is severe.
     #   Risk direction: higher incidence = higher risk (monotone +1)
     # -----------------------------------------------------------------------
-    df["epfo_payment_regularity"] = np.clip(_signal(0.90, 0.10, -0.20, 0.08), 0, 1)
+    df["epfo_payment_regularity"] = np.clip(_signal(0.90, 0.10, -0.20, 0.20), 0, 1)
     df["utility_delinquency_flag"] = (
-        RNG.uniform(0, 1, n) < (0.08 + target * 0.25)
+        RNG.uniform(0, 1, n) < (0.08 + target * 0.15)
     ).astype(float)
-    df["gst_late_fee_incidence"] = np.clip(_signal(0.06, 0.05, 0.15, 0.06), 0, 1)
+    df["gst_late_fee_incidence"] = np.clip(_signal(0.06, 0.05, 0.15, 0.15), 0, 1)
 
     # -----------------------------------------------------------------------
     # P4: Operational Vitality
@@ -395,10 +397,10 @@ def _add_synthetic_msme_overlay(df: pd.DataFrame) -> pd.DataFrame:
     #   kills revenue but the firm still owes EMIs).
     #   Risk direction: lower diversity = higher risk (monotone -1, inverted)
     # -----------------------------------------------------------------------
-    df["epfo_headcount_delta_6m"] = np.clip(_signal(0.03, 0.08, -0.10, 0.05), -0.5, 0.5)
-    df["epfo_headcount_delta_12m"] = np.clip(_signal(0.05, 0.10, -0.14, 0.06), -0.5, 0.5)
-    df["electricity_kwh_trend"] = np.clip(_signal(0.04, 0.06, -0.10, 0.04), -0.3, 0.3)
-    df["supplier_diversity_score"] = np.clip(_signal(0.60, 0.15, -0.18, 0.08), 0, 1)
+    df["epfo_headcount_delta_6m"] = np.clip(_signal(0.03, 0.08, -0.10, 0.10), -0.5, 0.5)
+    df["epfo_headcount_delta_12m"] = np.clip(_signal(0.05, 0.10, -0.14, 0.14), -0.5, 0.5)
+    df["electricity_kwh_trend"] = np.clip(_signal(0.04, 0.06, -0.10, 0.10), -0.3, 0.3)
+    df["supplier_diversity_score"] = np.clip(_signal(0.60, 0.15, -0.18, 0.18), 0, 1)
 
     return df
 
@@ -415,7 +417,8 @@ def build_and_save() -> pd.DataFrame:
     print("Building features...")
     df = build_features(app, inst)
 
-    feature_cols = ALL_FEATURES + ["TARGET", "SK_ID_CURR", "AMT_INCOME_TOTAL"]
+    extra = [c for c in ["TARGET", "SK_ID_CURR", "AMT_INCOME_TOTAL", "ORGANIZATION_TYPE"] if c in df.columns]
+    feature_cols = ALL_FEATURES + extra
     out = df[feature_cols].copy()
     out = out.dropna(subset=["TARGET"])
 

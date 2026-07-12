@@ -24,7 +24,6 @@ from src.config import (
 # ---------------------------------------------------------------------------
 _ML_READY = False
 _DICE_READY = False
-_ML_ERR = None
 try:
     from src.models.main_model import load_pillar_weights
     from src.models.thin_file import predict_thin_file
@@ -37,7 +36,6 @@ try:
     from src.consistency.engine import run_consistency_engine
     _ML_READY = True
 except Exception as _ml_err:
-    _ML_ERR = str(_ml_err)
     print(f"ML packages not available ({_ml_err}). /assess will return 503.")
 
 try:
@@ -116,7 +114,6 @@ def health():
     return {
         "status": "ok",
         "ml_packages_installed": _ML_READY,
-        "ml_import_error":       _ML_ERR,
         "dice_ready":            _DICE_READY,
         "main_model_loaded":     _main_model is not None,
         "thin_model_loaded":     _thin_model is not None,
@@ -191,10 +188,12 @@ def assess(msme: MSMEInput):
         if _cohort_weights is not None else _global_weights
     )
 
-    score       = _pct_to_score(peer_percentile)
-    score_lower = _pct_to_score(max(0,   peer_percentile - 10))
-    score_upper = _pct_to_score(min(100, peer_percentile + 10))
-    grade       = _score_to_grade(score)
+    # Display score uses a direct feature scorecard to avoid LightGBM cliff effects.
+    # peer_percentile (from PD) is kept for eligibility logic only.
+    score, sc_pct = _scorecard_score(X_row, active_weights)
+    score_lower   = max(SCORE_MIN, score - 30)
+    score_upper   = min(SCORE_MAX, score + 30)
+    grade         = _score_to_grade(score)
 
     eligibility_result = decide_eligibility(
         pd_value=pd_val, cohort=cohort,
@@ -243,7 +242,7 @@ def assess(msme: MSMEInput):
 
     return HealthCardResponse(
         score=score, score_ci_lower=score_lower, score_ci_upper=score_upper,
-        grade=grade, peer_percentile=round(peer_percentile, 1),
+        grade=grade, peer_percentile=sc_pct,
         eligibility=EligibilityOut(
             decision=eligibility_result.decision,
             reason=eligibility_result.reason,
@@ -277,6 +276,99 @@ def assess(msme: MSMEInput):
         manual_review_recommended=consistency.manual_review,
         missing_pillars=missing_pillars,
     )
+
+
+# ---------------------------------------------------------------------------
+# Scorecard: direct feature-to-score mapping (avoids LightGBM cliff effects)
+# Each entry: (bad_value, good_value) — score = (val-bad)/(good-bad), clipped [0,1]
+# ---------------------------------------------------------------------------
+_FEATURE_RANGES = {
+    # (bad_value, good_value) — feature score = clip((val-bad)/(good-bad), 0, 1)
+    # Anchored to realistic worst/best observed values; values beyond bad_value
+    # floor at _SCORE_FLOOR in the scorer and still pull the harmonic mean down.
+    "inflow_cv":                (0.80,  0.05),   # high CV = erratic cash flows
+    "min_balance_days":         (2.0,   28.0),   # days per month above min balance; more = better
+    "inflow_outflow_lag":       (30.0,  0.0),    # receivable collection lag days; 30+ = severe
+    "drawdown_recovery_days":   (90.0,  2.0),
+    "loss_absorption_buffer":   (1.0,   60.0),
+    "gst_mismatch_pct":         (0.45,  0.0),
+    "gst_filing_punctuality":   (0.35,  1.0),
+    "itc_reversal_freq":        (0.45,  0.0),
+    "buyer_concentration_hhi":  (1.0,   0.05),
+    "ext_source_1":             (0.15,  0.95),
+    "ext_source_2":             (0.15,  0.95),
+    "ext_source_3":             (0.15,  0.95),
+    "epfo_payment_regularity":  (0.35,  1.0),
+    "utility_delinquency_flag": (1.0,   0.0),
+    "gst_late_fee_incidence":   (0.55,  0.0),
+    "emi_bounce_rate":          (0.45,  0.0),
+    "avg_days_past_due":        (45.0,  0.0),
+    "epfo_headcount_delta_6m":  (-0.50, 0.30),
+    "epfo_headcount_delta_12m": (-0.60, 0.35),
+    "electricity_kwh_trend":    (-0.30, 0.25),
+    "supplier_diversity_score": (0.05,  0.95),
+    "debt_to_inflow_ratio":     (20.0,  0.3),
+    "current_ratio_proxy":      (0.15,  5.0),
+    "working_capital_cycle_days":(500.0, 10.0),
+    "annuity_to_income_ratio":  (0.80,  0.01),
+    "gstin_age_years":          (0.25,  12.0),
+    "address_churn_flag":       (1.0,   0.0),
+    "promoter_churn_flag":      (1.0,   0.0),
+    "directorship_overlap_flag":(1.0,   0.0),
+    "days_employed_years":      (0.25,  20.0),
+}
+
+
+def _feature_score(val: float, good: float, bad: float) -> float:
+    """
+    Inverse-square power law scorer: score = 1 / (1 + 4·ratio²)
+
+    ratio = (val − good) / (bad − good)
+      → ratio=0 at good_value  → score=1.000 (perfect)
+      → ratio=1 at bad_value   → score=0.200 (clearly bad)
+      → ratio=2 (2× past bad) → score=0.059 (very bad)
+      → ratio=6 (200d vs 30d) → score=0.007 (near-zero)
+
+    No clipping beyond the bad end: values like lag=200 continue
+    declining past lag=100 past lag=30 — each step measurably worse.
+    """
+    if good == bad:
+        return 0.5
+    ratio = max(0.0, (float(val) - good) / (bad - good))
+    return 1.0 / (1.0 + 4.0 * ratio ** 2)
+
+
+def _scorecard_score(X_row: "pd.DataFrame", active_weights: dict) -> tuple[int, float]:
+    """
+    Smooth display score from raw feature values — no LightGBM tree splits involved.
+    Each feature is scored via inverse-square power law (values beyond the bad end
+    keep declining), then aggregated by pillar using harmonic mean, then weighted
+    across pillars.
+    Returns (score in [300,900], peer_percentile_equivalent in [0,100]).
+    """
+    feat_scores: dict[str, float] = {}
+    for feat, (bad, good) in _FEATURE_RANGES.items():
+        val = X_row[feat].iloc[0]
+        if pd.isna(val):
+            feat_scores[feat] = 0.5
+        else:
+            feat_scores[feat] = _feature_score(float(val), good, bad)
+
+    pillar_0_1: dict[str, float] = {}
+    for pillar, feats in PILLARS.items():
+        vals = [feat_scores[f] for f in feats if f in feat_scores]
+        if not vals:
+            pillar_0_1[pillar] = 0.5
+        else:
+            # Harmonic mean: one bad feature pulls the whole pillar down hard
+            pillar_0_1[pillar] = float(len(vals) / sum(1.0 / max(v, 1e-6) for v in vals))
+
+    total_w = sum(active_weights.values()) or 1.0
+    overall = total_w / sum(w / max(pillar_0_1.get(p, 0.5), 1e-6) for p, w in active_weights.items())
+
+    score = int(SCORE_MIN + overall * (SCORE_MAX - SCORE_MIN))
+    peer_pct = round(overall * 100.0, 1)
+    return score, peer_pct
 
 
 # ---------------------------------------------------------------------------

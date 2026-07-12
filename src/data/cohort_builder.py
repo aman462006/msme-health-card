@@ -16,20 +16,66 @@ COHORT_MODELS_PATH = MODELS_DIR / "cohort_data.pkl"
 
 # Map Home Credit ORGANIZATION_TYPE to our industry buckets
 ORG_TYPE_MAP = {
-    "Industry": "manufacturing",
-    "Construction": "manufacturing",
-    "Agriculture": "manufacturing",
-    "Transport: type 1": "trading",
-    "Transport: type 2": "trading",
+    # Manufacturing — industrial production, construction, agriculture, utilities
+    "Industry: type 1":  "manufacturing",
+    "Industry: type 2":  "manufacturing",
+    "Industry: type 3":  "manufacturing",
+    "Industry: type 4":  "manufacturing",
+    "Industry: type 5":  "manufacturing",
+    "Industry: type 6":  "manufacturing",
+    "Industry: type 7":  "manufacturing",
+    "Industry: type 8":  "manufacturing",
+    "Industry: type 9":  "manufacturing",
+    "Industry: type 10": "manufacturing",
+    "Industry: type 11": "manufacturing",
+    "Industry: type 12": "manufacturing",
+    "Industry: type 13": "manufacturing",
+    "Construction":      "manufacturing",
+    "Agriculture":       "manufacturing",
+    "Electricity":       "manufacturing",
+    # Trading — wholesale/retail trade, transport of goods
     "Trade: type 1": "trading",
     "Trade: type 2": "trading",
     "Trade: type 3": "trading",
+    "Trade: type 4": "trading",
+    "Trade: type 5": "trading",
+    "Trade: type 6": "trading",
+    "Trade: type 7": "trading",
+    "Transport: type 1": "trading",
+    "Transport: type 2": "trading",
+    "Transport: type 3": "trading",
+    "Transport: type 4": "trading",
+    # Services — everything else
     "Business Entity Type 1": "services",
     "Business Entity Type 2": "services",
     "Business Entity Type 3": "services",
-    "Self-employed": "services",
-    "Government": "services",
-    "Other": "services",
+    "Self-employed":    "services",
+    "Government":       "services",
+    "Medicine":         "services",
+    "School":           "services",
+    "Kindergarten":     "services",
+    "University":       "services",
+    "Bank":             "services",
+    "Insurance":        "services",
+    "Telecom":          "services",
+    "Hotel":            "services",
+    "Restaurant":       "services",
+    "Security":         "services",
+    "Security Ministries": "services",
+    "Military":         "services",
+    "Police":           "services",
+    "Emergency":        "services",
+    "Postal":           "services",
+    "Housing":          "services",
+    "Legal Services":   "services",
+    "Advertising":      "services",
+    "Realtor":          "services",
+    "Culture":          "services",
+    "Cleaning":         "services",
+    "Mobile":           "services",
+    "Religion":         "services",
+    "Services":         "services",
+    "Other":            "services",
 }
 
 # Map AMT_INCOME_TOTAL (annual income in currency units) to turnover bands
@@ -115,14 +161,24 @@ def get_peer_percentile(pd_value: float, cohort: str, cohort_data: dict) -> floa
     Returns the percentile rank of this MSME's PD within its peer cohort.
     Lower PD = higher percentile (better than more peers).
     Returns 0-100 where 100 = best (lowest PD in cohort).
+
+    Uses log-space linear interpolation instead of raw searchsorted so that
+    tiny differences in near-zero PDs don't cause cliff-like percentile jumps
+    (previously, searchsorted on a run of identical zeros would jump 60 ranks
+    for a PD change of 1e-10).
     """
     key = cohort if cohort in cohort_data else "_global"
-    thresholds = cohort_data[key]["pd_percentiles"]  # index i = i-th percentile of PD
+    thresholds = np.array(cohort_data[key]["pd_percentiles"], dtype=float)
+    eps = 1e-9
 
-    # Find where this PD falls in the cohort distribution
-    pd_percentile_rank = float(np.searchsorted(thresholds, pd_value))
-    # Invert: lower PD = better score
-    return round(100.0 - pd_percentile_rank, 1)
+    log_thresh = np.log(thresholds + eps)
+    log_pd = np.log(pd_value + eps)
+
+    # Smooth interpolation: find fractional position in log-percentile space
+    percentile_points = np.arange(len(log_thresh), dtype=float)
+    pd_percentile_rank = float(np.interp(log_pd, log_thresh, percentile_points))
+
+    return round(max(0.0, 100.0 - pd_percentile_rank), 1)
 
 
 def get_eligibility_thresholds(cohort: str, cohort_data: dict) -> dict:

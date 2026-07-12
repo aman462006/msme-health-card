@@ -72,7 +72,7 @@ def run_reject_inference(
     # Step 1: initial model on approved-only
     base = build_lgbm()
     base.set_params(scale_pos_weight=spw)
-    model = CalibratedClassifierCV(base, method="isotonic", cv=3)
+    model = CalibratedClassifierCV(base, method="sigmoid", cv=3)
     model.fit(X_app, y_app)
 
     X_rej = df_rejected[ALL_FEATURES].copy()
@@ -106,7 +106,7 @@ def run_reject_inference(
 
         base_new = build_lgbm()
         base_new.set_params(scale_pos_weight=spw)
-        model = CalibratedClassifierCV(base_new, method="isotonic", cv=3)
+        model = CalibratedClassifierCV(base_new, method="sigmoid", cv=3)
         model.fit(X_union, y_union, sample_weight=w_union)
         # Step 5 loops back to Step 2 automatically
 
